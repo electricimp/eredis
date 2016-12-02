@@ -58,8 +58,16 @@
                  ConnectTimeout::integer() | undefined) ->
                         {ok, Pid::pid()} | {error, Reason::term()}.
 start_link(Host, Port, Database, Password, ReconnectSleep, ConnectTimeout) ->
-    gen_server:start_link(?MODULE, [Host, Port, Database, Password,
-                                    ReconnectSleep, ConnectTimeout], []).
+    case catch connect(Host, Port, list_to_binary(Password), read_database(Database), ConnectTimeout) of
+        {ok, Socket} ->
+            {ok, Client} = gen_server:start_link(?MODULE, [Host, Port, Database, Password,
+                                                           ReconnectSleep, ConnectTimeout], []),
+            gen_tcp:controlling_process(Socket, Client),
+            Client ! {connection_ready, Socket},
+            {ok, Client};
+        Error ->
+            Error
+    end.
 
 
 stop(Pid) ->
@@ -78,14 +86,10 @@ init([Host, Port, Database, Password, ReconnectSleep, ConnectTimeout]) ->
                    connect_timeout = ConnectTimeout,
 
                    parser_state = eredis_parser:init(),
-                   queue = queue:new()},
+                   queue = queue:new(),
+                   socket = undefined},
 
-    case connect(State) of
-        {ok, NewState} ->
-            {ok, NewState};
-        {error, Reason} ->
-            {stop, {connection_error, Reason}}
-    end.
+    {ok, State}.
 
 handle_call({request, Req}, From, State) ->
     do_request(Req, From, State);
@@ -156,6 +160,7 @@ handle_info({tcp_closed, _Socket}, #state{queue = Queue} = State) ->
 %% Redis is ready to accept requests, the given Socket is a socket
 %% already connected and authenticated.
 handle_info({connection_ready, Socket}, #state{socket = undefined} = State) ->
+    ok = inet:setopts(Socket, [{active, once}]),
     {noreply, State#state{socket = Socket}};
 
 %% eredis can be used in Poolboy, but it requires to support a simple API
@@ -286,15 +291,14 @@ safe_reply(From, Value) ->
 %% the correct database. These commands are synchronous and if Redis
 %% returns something we don't expect, we crash. Returns {ok, State} or
 %% {SomeError, Reason}.
-connect(State) ->
-    case gen_tcp:connect(State#state.host, State#state.port,
-                         ?SOCKET_OPTS, State#state.connect_timeout) of
+connect(Host, Port, Password, Database, Timeout) ->
+    case gen_tcp:connect(Host, Port, ?SOCKET_OPTS, Timeout) of
         {ok, Socket} ->
-            case authenticate(Socket, State#state.password) of
+            case authenticate(Socket, Password) of
                 ok ->
-                    case select_database(Socket, State#state.database) of
+                    case select_database(Socket, Database) of
                         ok ->
-                            {ok, State#state{socket = Socket}};
+                            {ok, Socket};
                         {error, Reason} ->
                             {error, {select_error, Reason}}
                     end;
@@ -339,7 +343,8 @@ do_sync_command(Socket, Command) ->
 %% successfully issuing the auth and select calls. When we have a
 %% connection, give the socket to the redis client.
 reconnect_loop(Client, #state{reconnect_sleep = ReconnectSleep} = State) ->
-    case catch(connect(State)) of
+    case catch(connect(State#state.host, State#state.port, State#state.password,
+                       State#state.database, State#state.connect_timeout)) of
         {ok, #state{socket = Socket}} ->
             gen_tcp:controlling_process(Socket, Client),
             Client ! {connection_ready, Socket};
